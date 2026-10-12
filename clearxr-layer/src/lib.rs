@@ -1,76 +1,36 @@
-/// Clear XR API Layer — intercepts OpenXR action state queries and injects
-/// controller touch/click events from the NV opaque data channel.
-///
-/// This allows any OpenXR app running on CloudXR to receive correct capacitive
-/// touch and button click events from PS Sense controllers, working around
-/// CloudXR bugs.
+//! Clear XR's OpenXR API layer. It receives the visionOS client's packets over CloudXR's opaque
+//! data channel: PSVR2 Sense controller state, which it presents to the game as Oculus Touch (or
+//! Khronos simple) controllers (action states, grip and aim poses, the interaction profile, and
+//! haptics), and stream configuration, which it writes to the CloudXR runtime's settings.
+//! `PROTOCOL.md` specifies the controller packets.
 
-mod opaque;
+mod bindings;
+mod channel;
+mod config;
+mod hooks;
+mod pose;
+mod protocol;
+mod state;
 
-use opaque::*;
 use openxr_sys as xr;
-use std::collections::{HashMap, HashSet};
+use openxr_sys::Handle;
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
-// ============================================================
-// Layer-specific loader types (not in openxr-sys)
-// ============================================================
+const LAYER_NAME: &str = "XR_APILAYER_CLEARXR_controller_fix";
+const TIME_CONVERSION_EXTENSION: &str = "XR_KHR_win32_convert_performance_counter_time";
+
+// Loader interface structures, which openxr-sys does not define.
 
 const STRUCT_LOADER_INFO: u32 = 1;
 const STRUCT_API_LAYER_REQUEST: u32 = 2;
 const STRUCT_API_LAYER_CREATE_INFO: u32 = 4;
 const STRUCT_API_LAYER_NEXT_INFO: u32 = 5;
-
 const LOADER_INFO_VERSION: u32 = 1;
 const API_LAYER_REQUEST_VERSION: u32 = 1;
-const CURRENT_LOADER_LAYER_IFACE_VERSION: u32 = 1;
-
+const LOADER_LAYER_INTERFACE_VERSION: u32 = 1;
 const MAX_LAYER_NAME: usize = 256;
 const MAX_SETTINGS_PATH: usize = 512;
-
-const LAYER_NAME: &str = "XR_APILAYER_CLEARXR_controller_fix";
-
-#[cfg(windows)]
-unsafe fn output_debug_string(message: &str) {
-    unsafe extern "system" {
-        fn OutputDebugStringA(lp_output_string: *const c_char);
-    }
-
-    let mut bytes: Vec<u8> = message
-        .as_bytes()
-        .iter()
-        .copied()
-        .filter(|b| *b != 0)
-        .collect();
-    bytes.push(b'\n');
-    bytes.push(0);
-
-    OutputDebugStringA(bytes.as_ptr() as *const c_char);
-}
-
-#[cfg(not(windows))]
-unsafe fn output_debug_string(_message: &str) {}
-
-pub(crate) fn debug_log(level: log::Level, message: &str) {
-    log::log!(level, "{}", message);
-    unsafe { output_debug_string(message); }
-}
-
-macro_rules! layer_log {
-    (error, $($arg:tt)*) => {{
-        let message = format!($($arg)*);
-        crate::debug_log(log::Level::Error, &message);
-    }};
-    (warn, $($arg:tt)*) => {{
-        let message = format!($($arg)*);
-        crate::debug_log(log::Level::Warn, &message);
-    }};
-    (info, $($arg:tt)*) => {{
-        let message = format!($($arg)*);
-        crate::debug_log(log::Level::Info, &message);
-    }};
-}
 
 #[repr(C)]
 pub struct NegotiateLoaderInfo {
@@ -91,14 +51,11 @@ pub struct NegotiateApiLayerRequest {
     layer_interface_version: u32,
     layer_api_version: xr::Version,
     get_instance_proc_addr: xr::pfn::GetInstanceProcAddr,
-    create_api_layer_instance: CreateApiLayerInstanceFn,
+    create_api_layer_instance: CreateApiLayerInstance,
 }
 
-type CreateApiLayerInstanceFn = unsafe extern "system" fn(
-    *const xr::InstanceCreateInfo,
-    *const ApiLayerCreateInfo,
-    *mut xr::Instance,
-) -> xr::Result;
+type CreateApiLayerInstance =
+    unsafe extern "system" fn(*const xr::InstanceCreateInfo, *const ApiLayerCreateInfo, *mut xr::Instance) -> xr::Result;
 
 #[repr(C)]
 struct ApiLayerCreateInfo {
@@ -117,147 +74,169 @@ struct ApiLayerNextInfo {
     struct_size: usize,
     layer_name: [c_char; MAX_LAYER_NAME],
     next_get_instance_proc_addr: xr::pfn::GetInstanceProcAddr,
-    next_create_api_layer_instance: CreateApiLayerInstanceFn,
+    next_create_api_layer_instance: CreateApiLayerInstance,
     next: *const ApiLayerNextInfo,
 }
 
-// ============================================================
-// Dispatch table — "next" function pointers
-// ============================================================
+// Logging: the `log` crate (stderr through env_logger), `%LOCALAPPDATA%\ClearXR\layer.log`, and,
+// on Windows, OutputDebugString.
 
-struct NextDispatch {
-    get_instance_proc_addr: xr::pfn::GetInstanceProcAddr,
-    destroy_instance: xr::pfn::DestroyInstance,
-    get_system: xr::pfn::GetSystem,
-    create_session: xr::pfn::CreateSession,
-    destroy_session: xr::pfn::DestroySession,
-    suggest_interaction_profile_bindings: xr::pfn::SuggestInteractionProfileBindings,
-    sync_actions: xr::pfn::SyncActions,
-    get_action_state_boolean: xr::pfn::GetActionStateBoolean,
-    get_action_state_float: xr::pfn::GetActionStateFloat,
-    apply_haptic_feedback: xr::pfn::ApplyHapticFeedback,
-    stop_haptic_feedback: xr::pfn::StopHapticFeedback,
-    path_to_string: xr::pfn::PathToString,
-    string_to_path: xr::pfn::StringToPath,
+fn log_file() -> &'static Mutex<Option<std::fs::File>> {
+    static FILE: std::sync::OnceLock<Mutex<Option<std::fs::File>>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        // Unit tests run on developers' machines and must not write to the user's log.
+        if cfg!(test) {
+            return Mutex::new(None);
+        }
+        let file = std::env::var_os("LOCALAPPDATA").and_then(|dir| {
+            let dir = std::path::PathBuf::from(dir).join("ClearXR");
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::OpenOptions::new().create(true).append(true).open(dir.join("layer.log")).ok()
+        });
+        Mutex::new(file)
+    })
 }
 
-// ============================================================
-// Binding map: which (action, hand) → opaque channel bit?
-// ============================================================
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Hand { Left, Right }
-
-/// How to derive a boolean action state from the opaque channel packet.
-#[derive(Clone, Copy, Debug)]
-enum BoolSource {
-    /// Check a bitmask bit in the buttons field.
-    Bit(u16),
-    /// True when the analog trigger value >= 1.0.
-    TriggerClick,
-    /// True when the analog grip value >= 1.0.
-    GripClick,
-}
-
-/// How to derive a float action state from the opaque channel packet.
-#[derive(Clone, Copy, Debug)]
-enum FloatSource {
-    /// Read the trigger f32 field directly.
-    Trigger,
-    /// Read the grip f32 field directly.
-    Grip,
-    /// Derive 1.0 / 0.0 from a touch bit (for sensors with no real analog).
-    TouchBit(u16),
-}
-
-/// Map component path suffix → boolean source for the opaque channel packet.
-/// Only overrides inputs that CloudXR does NOT provide correctly:
-///   - All capacitive touch sensors
-///   - Thumbstick click
-///   - Menu click
-/// CloudXR already handles: trigger click/value, grip click/value, face button clicks.
-fn component_to_bool(component: &str) -> Option<BoolSource> {
-    match component {
-        // ── Touch sensors (all missing from CloudXR) ──
-        "/input/x/touch" | "/input/a/touch"
-            | "/input/square/touch" | "/input/cross/touch"  => Some(BoolSource::Bit(SC_TOUCH_A)),
-        "/input/y/touch" | "/input/b/touch"
-            | "/input/triangle/touch" | "/input/circle/touch" => Some(BoolSource::Bit(SC_TOUCH_B)),
-        "/input/trigger/touch" | "/input/l2/touch" | "/input/r2/touch"
-            => Some(BoolSource::Bit(SC_TOUCH_TRIGGER)),
-        "/input/grip/touch" | "/input/squeeze/touch"
-            | "/input/l1/touch" | "/input/r1/touch"         => Some(BoolSource::Bit(SC_TOUCH_GRIP)),
-        "/input/thumbstick/touch"
-            | "/input/left_stick/touch" | "/input/right_stick/touch" => Some(BoolSource::Bit(SC_TOUCH_THUMBSTICK)),
-
-        // ── Thumbstick click (missing from CloudXR) ──
-        "/input/thumbstick/click"
-            | "/input/left_stick/click" | "/input/right_stick/click" => Some(BoolSource::Bit(SC_BTN_THUMBSTICK)),
-
-        // ── Menu click (missing from CloudXR on right hand) ──
-        "/input/menu/click"
-            | "/input/create/click" | "/input/options/click" => Some(BoolSource::Bit(SC_BTN_MENU)),
-
-        _ => None,
+fn log(level: log::Level, message: &str) {
+    log::log!(level, "[ClearXR Layer] {message}");
+    if let Some(file) = log_file().lock().unwrap().as_mut() {
+        use std::io::Write;
+        let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let _ = writeln!(file, "{}.{:03} pid {} {level} {message}",
+            since_epoch.as_secs(), since_epoch.subsec_millis(), std::process::id());
+    }
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn OutputDebugStringA(text: *const c_char);
+        }
+        let mut bytes: Vec<u8> = format!("[ClearXR Layer] {message}\n").into_bytes();
+        bytes.retain(|b| *b != 0);
+        bytes.push(0);
+        OutputDebugStringA(bytes.as_ptr() as *const c_char);
     }
 }
 
-/// Map float/value component paths → the source for the float override.
-/// Only overrides inputs that CloudXR does NOT provide.
-/// CloudXR already handles trigger/value and grip/value correctly.
-fn component_to_float(component: &str) -> Option<FloatSource> {
-    match component {
-        // PSVR2 proximity sensors — not available through CloudXR
-        "/input/l1_sensor/value" | "/input/r1_sensor/value"
-            => Some(FloatSource::TouchBit(SC_TOUCH_GRIP)),
-        "/input/l2_sensor/value" | "/input/r2_sensor/value"
-            => Some(FloatSource::TouchBit(SC_TOUCH_TRIGGER)),
+pub(crate) fn log_info(message: &str) {
+    log(log::Level::Info, message);
+}
 
-        _ => None,
+pub(crate) fn log_warn(message: &str) {
+    log(log::Level::Warn, message);
+}
+
+// Dispatch to the next layer or the runtime.
+
+type ConvertTime = unsafe extern "system" fn(xr::Instance, *const i64, *mut xr::Time) -> xr::Result;
+
+pub(crate) struct Next {
+    pub get_instance_proc_addr: xr::pfn::GetInstanceProcAddr,
+    pub destroy_instance: xr::pfn::DestroyInstance,
+    pub create_session: xr::pfn::CreateSession,
+    pub destroy_session: xr::pfn::DestroySession,
+    pub create_reference_space: xr::pfn::CreateReferenceSpace,
+    pub create_action_space: xr::pfn::CreateActionSpace,
+    pub destroy_space: xr::pfn::DestroySpace,
+    pub create_action: xr::pfn::CreateAction,
+    pub suggest_interaction_profile_bindings: xr::pfn::SuggestInteractionProfileBindings,
+    pub attach_session_action_sets: xr::pfn::AttachSessionActionSets,
+    pub sync_actions: xr::pfn::SyncActions,
+    pub get_action_state_boolean: xr::pfn::GetActionStateBoolean,
+    pub get_action_state_float: xr::pfn::GetActionStateFloat,
+    pub get_action_state_vector2f: xr::pfn::GetActionStateVector2f,
+    pub get_action_state_pose: xr::pfn::GetActionStatePose,
+    pub get_current_interaction_profile: xr::pfn::GetCurrentInteractionProfile,
+    pub locate_space: xr::pfn::LocateSpace,
+    pub locate_spaces: Option<xr::pfn::LocateSpaces>,
+    pub locate_spaces_khr: Option<xr::pfn::LocateSpacesKHR>,
+    pub poll_event: xr::pfn::PollEvent,
+    pub wait_frame: xr::pfn::WaitFrame,
+    pub apply_haptic_feedback: xr::pfn::ApplyHapticFeedback,
+    pub stop_haptic_feedback: xr::pfn::StopHapticFeedback,
+    pub path_to_string: xr::pfn::PathToString,
+    pub string_to_path: xr::pfn::StringToPath,
+}
+
+unsafe fn load_optional<T>(gpa: xr::pfn::GetInstanceProcAddr, instance: xr::Instance, name: &str) -> Option<T> {
+    let name = format!("{name}\0");
+    let mut function: Option<xr::pfn::VoidFunction> = None;
+    gpa(instance, name.as_ptr() as *const c_char, &mut function);
+    function.map(|f| std::mem::transmute_copy(&f))
+}
+
+unsafe fn load<T>(gpa: xr::pfn::GetInstanceProcAddr, instance: xr::Instance, name: &str) -> Result<T, String> {
+    load_optional(gpa, instance, name).ok_or_else(|| format!("the next layer lacks {name}"))
+}
+
+impl Next {
+    unsafe fn load(gpa: xr::pfn::GetInstanceProcAddr, instance: xr::Instance) -> Result<Next, String> {
+        Ok(Next {
+            get_instance_proc_addr: gpa,
+            destroy_instance: load(gpa, instance, "xrDestroyInstance")?,
+            create_session: load(gpa, instance, "xrCreateSession")?,
+            destroy_session: load(gpa, instance, "xrDestroySession")?,
+            create_reference_space: load(gpa, instance, "xrCreateReferenceSpace")?,
+            create_action_space: load(gpa, instance, "xrCreateActionSpace")?,
+            destroy_space: load(gpa, instance, "xrDestroySpace")?,
+            create_action: load(gpa, instance, "xrCreateAction")?,
+            suggest_interaction_profile_bindings: load(gpa, instance, "xrSuggestInteractionProfileBindings")?,
+            attach_session_action_sets: load(gpa, instance, "xrAttachSessionActionSets")?,
+            sync_actions: load(gpa, instance, "xrSyncActions")?,
+            get_action_state_boolean: load(gpa, instance, "xrGetActionStateBoolean")?,
+            get_action_state_float: load(gpa, instance, "xrGetActionStateFloat")?,
+            get_action_state_vector2f: load(gpa, instance, "xrGetActionStateVector2f")?,
+            get_action_state_pose: load(gpa, instance, "xrGetActionStatePose")?,
+            get_current_interaction_profile: load(gpa, instance, "xrGetCurrentInteractionProfile")?,
+            locate_space: load(gpa, instance, "xrLocateSpace")?,
+            locate_spaces: load_optional(gpa, instance, "xrLocateSpaces"),
+            locate_spaces_khr: load_optional(gpa, instance, "xrLocateSpacesKHR"),
+            poll_event: load(gpa, instance, "xrPollEvent")?,
+            wait_frame: load(gpa, instance, "xrWaitFrame")?,
+            apply_haptic_feedback: load(gpa, instance, "xrApplyHapticFeedback")?,
+            stop_haptic_feedback: load(gpa, instance, "xrStopHapticFeedback")?,
+            path_to_string: load(gpa, instance, "xrPathToString")?,
+            string_to_path: load(gpa, instance, "xrStringToPath")?,
+        })
     }
 }
 
-/// Parse "/user/hand/left/input/x/touch" → (Hand::Left, "/input/x/touch")
-fn parse_binding_path(path: &str) -> Option<(Hand, &str)> {
-    if let Some(rest) = path.strip_prefix("/user/hand/left") {
-        Some((Hand::Left, rest))
-    } else if let Some(rest) = path.strip_prefix("/user/hand/right") {
-        Some((Hand::Right, rest))
-    } else {
-        None
+pub(crate) struct Layer {
+    pub instance: xr::Instance,
+    pub next: Next,
+    /// None when the runtime has no opaque data channel; every call then passes through.
+    pub channel_functions: Option<channel::Functions>,
+    convert_time: Option<ConvertTime>,
+    pub state: Mutex<state::State>,
+}
+
+impl Layer {
+    /// The runtime's current `XrTime`, when it supports converting the performance counter.
+    pub fn now(&self) -> Option<xr::Time> {
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn QueryPerformanceCounter(count: *mut i64) -> i32;
+            }
+            let convert = self.convert_time?;
+            let mut counter = 0i64;
+            QueryPerformanceCounter(&mut counter);
+            let mut time = xr::Time::from_nanos(0);
+            return (convert(self.instance, &counter, &mut time) == xr::Result::SUCCESS).then_some(time);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self.convert_time;
+            None
+        }
     }
 }
 
-fn is_haptic_output_path(component: &str) -> bool {
-    component == "/output/haptic"
-}
-
-// ============================================================
-// Global layer state
-// ============================================================
-
-struct LayerState {
-    instance: xr::Instance,
-    next: NextDispatch,
-    system_id: u64,
-    opaque: Option<OpaqueChannel>,
-    /// (action_handle_raw, hand) → how to derive the boolean override
-    overrides: HashMap<(u64, Hand), BoolSource>,
-    /// (action_handle_raw, hand) → how to derive the float override
-    float_overrides: HashMap<(u64, Hand), FloatSource>,
-    haptic_actions: HashSet<(u64, Hand)>,
-    /// Has the opaque channel extension been enabled?
-    has_opaque_ext: bool,
-}
-
-static LAYER: Mutex<Option<LayerState>> = Mutex::new(None);
-
-// Store the next layer's getInstanceProcAddr for use during instance creation
+static LAYER: RwLock<Option<Arc<Layer>>> = RwLock::new(None);
 static NEXT_GPA: Mutex<Option<xr::pfn::GetInstanceProcAddr>> = Mutex::new(None);
-static NEXT_CREATE: Mutex<Option<CreateApiLayerInstanceFn>> = Mutex::new(None);
-// ============================================================
-// DLL export: xrNegotiateLoaderApiLayerInterface
-// ============================================================
+
+pub(crate) fn layer() -> Option<Arc<Layer>> {
+    LAYER.read().unwrap().clone()
+}
 
 #[no_mangle]
 pub unsafe extern "system" fn xrNegotiateLoaderApiLayerInterface(
@@ -265,309 +244,161 @@ pub unsafe extern "system" fn xrNegotiateLoaderApiLayerInterface(
     _layer_name: *const c_char,
     request: *mut NegotiateApiLayerRequest,
 ) -> xr::Result {
-    // Initialize logging — write to both stderr and a file for easy debugging.
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .try_init();
-
-    // Also log to a file via OutputDebugString (visible in DebugView/VS Output)
-    layer_log!(info, "[ClearXR Layer] xrNegotiateLoaderApiLayerInterface called.");
-
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .try_init();
     if loader_info.is_null() || request.is_null() {
-        layer_log!(error, "[ClearXR Layer] Negotiation received null pointers.");
         return xr::Result::ERROR_INITIALIZATION_FAILED;
     }
-
     let info = &*loader_info;
+    let request = &mut *request;
     if info.struct_type != STRUCT_LOADER_INFO
         || info.struct_version != LOADER_INFO_VERSION
         || info.struct_size != std::mem::size_of::<NegotiateLoaderInfo>()
+        || request.struct_type != STRUCT_API_LAYER_REQUEST
+        || request.struct_version != API_LAYER_REQUEST_VERSION
+        || request.struct_size != std::mem::size_of::<NegotiateApiLayerRequest>()
+        || !(info.min_interface_version..=info.max_interface_version).contains(&LOADER_LAYER_INTERFACE_VERSION)
     {
-        layer_log!(
-            error,
-            "[ClearXR Layer] Loader info mismatch: type={} version={} size={} expected_size={}",
-            info.struct_type,
-            info.struct_version,
-            info.struct_size,
-            std::mem::size_of::<NegotiateLoaderInfo>()
-        );
+        log_warn("The loader's interface does not match this layer");
         return xr::Result::ERROR_INITIALIZATION_FAILED;
     }
-
-    let req = &mut *request;
-    if req.struct_type != STRUCT_API_LAYER_REQUEST
-        || req.struct_version != API_LAYER_REQUEST_VERSION
-        || req.struct_size != std::mem::size_of::<NegotiateApiLayerRequest>()
-    {
-        layer_log!(
-            error,
-            "[ClearXR Layer] API layer request mismatch: type={} version={} size={} expected_size={}",
-            req.struct_type,
-            req.struct_version,
-            req.struct_size,
-            std::mem::size_of::<NegotiateApiLayerRequest>()
-        );
-        return xr::Result::ERROR_INITIALIZATION_FAILED;
-    }
-
-    // Verify interface version is compatible
-    if CURRENT_LOADER_LAYER_IFACE_VERSION < info.min_interface_version
-        || CURRENT_LOADER_LAYER_IFACE_VERSION > info.max_interface_version
-    {
-        layer_log!(
-            error,
-            "[ClearXR Layer] Interface version {} outside loader range {}..={}.",
-            CURRENT_LOADER_LAYER_IFACE_VERSION,
-            info.min_interface_version,
-            info.max_interface_version
-        );
-        return xr::Result::ERROR_INITIALIZATION_FAILED;
-    }
-
-    req.layer_interface_version = CURRENT_LOADER_LAYER_IFACE_VERSION;
-    req.layer_api_version = xr::Version::new(1, 0, 0);
-    req.get_instance_proc_addr = layer_get_instance_proc_addr;
-    req.create_api_layer_instance = layer_create_api_layer_instance;
-
-    layer_log!(info, "[ClearXR Layer] Negotiated successfully.");
+    request.layer_interface_version = LOADER_LAYER_INTERFACE_VERSION;
+    request.layer_api_version = xr::Version::new(1, 0, 0);
+    request.get_instance_proc_addr = get_instance_proc_addr;
+    request.create_api_layer_instance = create_api_layer_instance;
     xr::Result::SUCCESS
 }
 
-// ============================================================
-// xrCreateApiLayerInstance — called by the loader to create instance through this layer
-// ============================================================
-
-unsafe extern "system" fn layer_create_api_layer_instance(
-    ci: *const xr::InstanceCreateInfo,
-    layer_ci: *const ApiLayerCreateInfo,
+unsafe extern "system" fn create_api_layer_instance(
+    create_info: *const xr::InstanceCreateInfo,
+    layer_info: *const ApiLayerCreateInfo,
     instance_out: *mut xr::Instance,
 ) -> xr::Result {
-    layer_log!(info, "[ClearXR Layer] layer_create_api_layer_instance called.");
-
-    if ci.is_null() || layer_ci.is_null() || instance_out.is_null() {
-        layer_log!(error, "[ClearXR Layer] Null pointer passed to create instance (ci={} layer_ci={} out={})",
-            !ci.is_null(), !layer_ci.is_null(), !instance_out.is_null());
+    if create_info.is_null() || layer_info.is_null() || instance_out.is_null() {
         return xr::Result::ERROR_INITIALIZATION_FAILED;
     }
-
-    let layer_info = &*layer_ci;
-    layer_log!(info, "[ClearXR Layer] layer_ci struct_type={}, struct_version={}, struct_size={}",
-        layer_info.struct_type, layer_info.struct_version, layer_info.struct_size);
-
+    let layer_info = &*layer_info;
     if layer_info.struct_type != STRUCT_API_LAYER_CREATE_INFO
-        || layer_info.struct_version != LOADER_INFO_VERSION
         || layer_info.struct_size != std::mem::size_of::<ApiLayerCreateInfo>()
     {
-        layer_log!(
-            error,
-            "[ClearXR Layer] Unexpected create info: type={} version={} size={} expected_type={} expected_version={} expected_size={}",
-            layer_info.struct_type,
-            layer_info.struct_version,
-            layer_info.struct_size,
-            STRUCT_API_LAYER_CREATE_INFO,
-            LOADER_INFO_VERSION,
-            std::mem::size_of::<ApiLayerCreateInfo>()
-        );
+        log_warn("Unexpected ApiLayerCreateInfo from the loader");
         return xr::Result::ERROR_INITIALIZATION_FAILED;
     }
 
-    // Log the app's requested extensions
-    {
-        let orig_ci = &*ci;
-        let count = orig_ci.enabled_extension_count as usize;
-        layer_log!(info, "[ClearXR Layer] App requests {} extensions:", count);
-        for i in 0..count {
-            let ext = CStr::from_ptr(*orig_ci.enabled_extension_names.add(i));
-            layer_log!(info, "[ClearXR Layer]   - {:?}", ext);
-        }
-    }
-
-    // Walk the next_info chain to find our layer's entry
-    let mut next_info = layer_info.next_info;
-    let mut chain_idx = 0;
-    while !next_info.is_null() {
-        let ni = &*next_info;
-        let ni_name = CStr::from_ptr(ni.layer_name.as_ptr());
-        layer_log!(info, "[ClearXR Layer] Chain[{}]: struct_type={}, name={:?}",
-            chain_idx, ni.struct_type, ni_name);
-
-        if ni.struct_type != STRUCT_API_LAYER_NEXT_INFO {
-            layer_log!(warn, "[ClearXR Layer] Unexpected struct_type in chain, stopping walk.");
+    // Find this layer's entry in the chain.
+    let mut entry = layer_info.next_info;
+    while !entry.is_null() && (*entry).struct_type == STRUCT_API_LAYER_NEXT_INFO {
+        if CStr::from_ptr((*entry).layer_name.as_ptr()).to_bytes() == LAYER_NAME.as_bytes() {
             break;
         }
+        entry = (*entry).next;
+    }
+    if entry.is_null() || (*entry).struct_type != STRUCT_API_LAYER_NEXT_INFO {
+        log_warn(&format!("{LAYER_NAME} is missing from the loader's layer chain"));
+        return xr::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    let entry = &*entry;
+    let gpa = entry.next_get_instance_proc_addr;
+    *NEXT_GPA.lock().unwrap() = Some(gpa);
 
-        if ni_name.to_bytes() == LAYER_NAME.as_bytes() {
-            layer_log!(info, "[ClearXR Layer] Found our entry in the chain.");
-            let next_gpa = ni.next_get_instance_proc_addr;
-            let next_create = ni.next_create_api_layer_instance;
+    // Enable the opaque data channel, preferring NVX1 when both exist, and the time conversion the
+    // pose extrapolation uses, on top of what the application asked for. The extensions come from
+    // the bottom of the chain: a layer below this one may not answer before its own instance
+    // exists.
+    let mut bottom = entry;
+    while !bottom.next.is_null() && (*bottom.next).struct_type == STRUCT_API_LAYER_NEXT_INFO {
+        bottom = &*bottom.next;
+    }
+    let available = available_extensions(bottom.next_get_instance_proc_addr);
+    log_info(&format!("Runtime extensions: {}", available.len()));
+    let create_info = &*create_info;
+    let requested: Vec<*const c_char> = (0..create_info.enabled_extension_count as usize)
+        .map(|i| *create_info.enabled_extension_names.add(i))
+        .collect();
+    let is_requested = |name: &str| requested.iter().any(|&p| CStr::from_ptr(p).to_bytes() == name.as_bytes());
+    let opaque = channel::EXTENSIONS.into_iter().rev().find(|name| available.iter().any(|a| a == name));
+    let time_conversion = available.iter().any(|a| a == TIME_CONVERSION_EXTENSION);
+    let added: Vec<String> = opaque.into_iter()
+        .chain(time_conversion.then_some(TIME_CONVERSION_EXTENSION))
+        .filter(|name| !is_requested(name))
+        .map(|name| format!("{name}\0"))
+        .collect();
+    let mut extensions = requested.clone();
+    extensions.extend(added.iter().map(|name| name.as_ptr() as *const c_char));
 
-            // Store for later use
-            *NEXT_GPA.lock().unwrap() = Some(next_gpa);
-            *NEXT_CREATE.lock().unwrap() = Some(next_create);
-
-            // Check which extensions the runtime supports
-            layer_log!(info, "[ClearXR Layer] Checking for available extensions...");
-            let has_nvx1 = check_extension_available(next_gpa, "XR_NVX1_opaque_data_channel");
-            let has_nv = check_extension_available(next_gpa, "XR_NV_opaque_data_channel");
-            let has_opaque = has_nvx1 || has_nv;
-            layer_log!(info, "[ClearXR Layer] Extension check: NVX1={}, NV={}", has_nvx1, has_nv);
-
-            // Collect extension pointers: start with the app's original list,
-            // then append the opaque data channel extension if available.
-            let orig_ci = &*ci;
-            let mut ext_ptrs: Vec<*const c_char> = (0..orig_ci.enabled_extension_count as usize)
-                .map(|i| *orig_ci.enabled_extension_names.add(i))
-                .collect();
-
-            if has_opaque {
-                let opaque_ext: &[u8] = if has_nvx1 {
-                    b"XR_NVX1_opaque_data_channel\0"
-                } else {
-                    b"XR_NV_opaque_data_channel\0"
-                };
-                ext_ptrs.push(opaque_ext.as_ptr() as *const c_char);
-            }
-
-            // Build the next layer's ApiLayerCreateInfo
-            let next_layer_ci = ApiLayerCreateInfo {
-                struct_type: STRUCT_API_LAYER_CREATE_INFO,
-                struct_version: layer_info.struct_version,
-                struct_size: layer_info.struct_size,
-                loader_instance: layer_info.loader_instance,
-                settings_file_location: layer_info.settings_file_location,
-                next_info: ni.next,
-            };
-
-            let mut modified_ci = *ci;
-            modified_ci.enabled_extension_count = ext_ptrs.len() as u32;
-            modified_ci.enabled_extension_names = ext_ptrs.as_ptr();
-
-            layer_log!(info, "[ClearXR Layer] Calling next_create with {} extensions.", ext_ptrs.len());
-            let result = (next_create)(&modified_ci, &next_layer_ci, instance_out);
-
-            if result != xr::Result::SUCCESS {
-                layer_log!(warn, "[ClearXR Layer] Next layer create instance failed: {:?}", result);
-                return result;
-            }
-
-            let instance = *instance_out;
-            let dispatch = build_dispatch(next_gpa, instance);
-
-            *LAYER.lock().unwrap() = Some(LayerState {
-                instance,
-                next: dispatch,
-                system_id: 0,
-                opaque: None,
-                overrides: HashMap::new(),
-                float_overrides: HashMap::new(),
-                haptic_actions: HashSet::new(),
-                has_opaque_ext: has_opaque,
-            });
-
-            layer_log!(info, "[ClearXR Layer] Instance created, layer active.");
-            return xr::Result::SUCCESS;
-        }
-
-        chain_idx += 1;
-        next_info = ni.next;
+    let mut modified = *create_info;
+    modified.enabled_extension_count = extensions.len() as u32;
+    modified.enabled_extension_names = extensions.as_ptr();
+    let next_layer_info = ApiLayerCreateInfo {
+        struct_type: layer_info.struct_type,
+        struct_version: layer_info.struct_version,
+        struct_size: layer_info.struct_size,
+        loader_instance: layer_info.loader_instance,
+        settings_file_location: layer_info.settings_file_location,
+        next_info: entry.next,
+    };
+    let result = (entry.next_create_api_layer_instance)(&modified, &next_layer_info, instance_out);
+    if result != xr::Result::SUCCESS {
+        return result;
     }
 
-    layer_log!(error, "[ClearXR Layer] Could not find '{}' in chain after {} entries.", LAYER_NAME, chain_idx);
-    xr::Result::ERROR_INITIALIZATION_FAILED
-}
-
-/// Check if an extension is available by calling xrEnumerateInstanceExtensionProperties
-/// through the next layer (with NULL instance).
-unsafe fn check_extension_available(
-    next_gpa: xr::pfn::GetInstanceProcAddr,
-    ext_name: &str,
-) -> bool {
-    let mut fp: Option<xr::pfn::VoidFunction> = None;
-    let r = (next_gpa)(
-        xr::Instance::NULL,
-        b"xrEnumerateInstanceExtensionProperties\0".as_ptr() as *const c_char,
-        &mut fp,
-    );
-    let enumerate: xr::pfn::EnumerateInstanceExtensionProperties = match fp {
-        Some(f) => std::mem::transmute(f),
-        None => {
-            layer_log!(warn, "[ClearXR Layer] Could not load xrEnumerateInstanceExtensionProperties (result={:?})", r);
-            return false;
+    let instance = *instance_out;
+    let next = match Next::load(gpa, instance) {
+        Ok(next) => next,
+        Err(error) => {
+            log_warn(&format!("Layer disabled: {error}"));
+            return result;
         }
     };
-
-    let mut count: u32 = 0;
-    let r = (enumerate)(std::ptr::null(), 0, &mut count, std::ptr::null_mut());
-    if r != xr::Result::SUCCESS || count == 0 {
-        layer_log!(warn, "[ClearXR Layer] EnumerateExtensions(count) failed: {:?}, count={}", r, count);
-        return false;
+    let channel_functions = if opaque.is_some() { channel::Functions::load(gpa, instance) } else { None };
+    match &channel_functions {
+        Some(functions) => log_info(&format!("Active; opaque data channel entry points use the {} suffix", functions.suffix)),
+        None => log_info("Inactive: the runtime has no opaque data channel, so every call passes through"),
     }
-
-    let mut props: Vec<xr::ExtensionProperties> = vec![
-        xr::ExtensionProperties {
-            ty: xr::ExtensionProperties::TYPE,
-            next: std::ptr::null_mut(),
-            extension_name: [0; 128],
-            extension_version: 0,
-        };
-        count as usize
-    ];
-    let r = (enumerate)(std::ptr::null(), count, &mut count, props.as_mut_ptr());
-    if r != xr::Result::SUCCESS {
-        layer_log!(warn, "[ClearXR Layer] EnumerateExtensions(props) failed: {:?}", r);
-        return false;
-    }
-
-    for p in &props {
-        let name = CStr::from_ptr(p.extension_name.as_ptr());
-        if let Ok(s) = name.to_str() {
-            if s == ext_name {
-                return true;
-            }
-        }
-    }
-    false
+    let convert_time = if time_conversion {
+        load_optional(gpa, instance, "xrConvertWin32PerformanceCounterToTimeKHR")
+    } else {
+        log_warn("The runtime cannot convert the performance counter to XrTime; poses are extrapolated less");
+        None
+    };
+    *LAYER.write().unwrap() = Some(Arc::new(Layer {
+        instance,
+        next,
+        channel_functions,
+        convert_time,
+        state: Mutex::new(state::State::default()),
+    }));
+    result
 }
 
-/// Load a function pointer from the next layer's dispatch.
-unsafe fn load_fn<T>(
-    gpa: xr::pfn::GetInstanceProcAddr,
-    instance: xr::Instance,
-    name: &[u8], // null-terminated
-) -> T {
-    let mut fp: Option<xr::pfn::VoidFunction> = None;
-    (gpa)(instance, name.as_ptr() as *const c_char, &mut fp);
-    std::mem::transmute_copy(&fp.expect(&format!(
-        "Failed to load {}",
-        std::str::from_utf8(&name[..name.len() - 1]).unwrap_or("?")
-    )))
-}
-
-unsafe fn build_dispatch(gpa: xr::pfn::GetInstanceProcAddr, instance: xr::Instance) -> NextDispatch {
-    NextDispatch {
-        get_instance_proc_addr: gpa,
-        destroy_instance: load_fn(gpa, instance, b"xrDestroyInstance\0"),
-        get_system: load_fn(gpa, instance, b"xrGetSystem\0"),
-        create_session: load_fn(gpa, instance, b"xrCreateSession\0"),
-        destroy_session: load_fn(gpa, instance, b"xrDestroySession\0"),
-        suggest_interaction_profile_bindings: load_fn(gpa, instance, b"xrSuggestInteractionProfileBindings\0"),
-        sync_actions: load_fn(gpa, instance, b"xrSyncActions\0"),
-        get_action_state_boolean: load_fn(gpa, instance, b"xrGetActionStateBoolean\0"),
-        get_action_state_float: load_fn(gpa, instance, b"xrGetActionStateFloat\0"),
-        apply_haptic_feedback: load_fn(gpa, instance, b"xrApplyHapticFeedback\0"),
-        stop_haptic_feedback: load_fn(gpa, instance, b"xrStopHapticFeedback\0"),
-        path_to_string: load_fn(gpa, instance, b"xrPathToString\0"),
-        string_to_path: load_fn(gpa, instance, b"xrStringToPath\0"),
+unsafe fn available_extensions(gpa: xr::pfn::GetInstanceProcAddr) -> Vec<String> {
+    let Some(enumerate) = load_optional::<xr::pfn::EnumerateInstanceExtensionProperties>(
+        gpa, xr::Instance::NULL, "xrEnumerateInstanceExtensionProperties")
+    else {
+        return Vec::new();
+    };
+    let mut count = 0u32;
+    if enumerate(std::ptr::null(), 0, &mut count, std::ptr::null_mut()) != xr::Result::SUCCESS {
+        return Vec::new();
     }
+    let empty = xr::ExtensionProperties {
+        ty: xr::ExtensionProperties::TYPE,
+        next: std::ptr::null_mut(),
+        extension_name: [0; xr::MAX_EXTENSION_NAME_SIZE],
+        extension_version: 0,
+    };
+    let mut properties = vec![empty; count as usize];
+    if enumerate(std::ptr::null(), count, &mut count, properties.as_mut_ptr()) != xr::Result::SUCCESS {
+        return Vec::new();
+    }
+    properties.iter()
+        .take(count as usize)
+        .filter_map(|p| CStr::from_ptr(p.extension_name.as_ptr()).to_str().ok().map(str::to_owned))
+        .collect()
 }
 
-// ============================================================
-// xrGetInstanceProcAddr — dispatch to our hooks or pass through
-// ============================================================
-
-unsafe extern "system" fn layer_get_instance_proc_addr(
+pub(crate) unsafe extern "system" fn get_instance_proc_addr(
     instance: xr::Instance,
     name: *const c_char,
     function: *mut Option<xr::pfn::VoidFunction>,
@@ -575,566 +406,23 @@ unsafe extern "system" fn layer_get_instance_proc_addr(
     if name.is_null() || function.is_null() {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
-
-    let name_str = CStr::from_ptr(name);
-
-    // Return our intercepted functions
-    macro_rules! intercept {
-        ($fn_name:expr, $fn_ptr:expr) => {
-            if name_str.to_bytes() == $fn_name {
-                *function = Some(std::mem::transmute($fn_ptr as *const ()));
-                return xr::Result::SUCCESS;
-            }
-        };
+    let name = CStr::from_ptr(name);
+    if let Some(hook) = hooks::lookup(name.to_bytes(), layer().as_deref()) {
+        *function = Some(hook);
+        return xr::Result::SUCCESS;
     }
-
-    intercept!(b"xrGetInstanceProcAddr", layer_get_instance_proc_addr as xr::pfn::GetInstanceProcAddr);
-    intercept!(b"xrEnumerateInstanceExtensionProperties", hook_enumerate_extensions as xr::pfn::EnumerateInstanceExtensionProperties);
-    intercept!(b"xrDestroyInstance", hook_destroy_instance as xr::pfn::DestroyInstance);
-    intercept!(b"xrGetSystem", hook_get_system as xr::pfn::GetSystem);
-    intercept!(b"xrCreateSession", hook_create_session as xr::pfn::CreateSession);
-    intercept!(b"xrDestroySession", hook_destroy_session as xr::pfn::DestroySession);
-    intercept!(b"xrSuggestInteractionProfileBindings", hook_suggest_bindings as xr::pfn::SuggestInteractionProfileBindings);
-    intercept!(b"xrSyncActions", hook_sync_actions as xr::pfn::SyncActions);
-    intercept!(b"xrGetActionStateBoolean", hook_get_action_state_boolean as xr::pfn::GetActionStateBoolean);
-    intercept!(b"xrGetActionStateFloat", hook_get_action_state_float as xr::pfn::GetActionStateFloat);
-    intercept!(b"xrApplyHapticFeedback", hook_apply_haptic_feedback as xr::pfn::ApplyHapticFeedback);
-    intercept!(b"xrStopHapticFeedback", hook_stop_haptic_feedback as xr::pfn::StopHapticFeedback);
-
-    // Pass through to next layer
-    let guard = LAYER.lock().unwrap();
-    if let Some(ref state) = *guard {
-        return (state.next.get_instance_proc_addr)(instance, name, function);
+    if let Some(layer) = layer() {
+        return (layer.next.get_instance_proc_addr)(instance, name.as_ptr(), function);
     }
-
-    // During negotiation, before instance exists, try stored next_gpa
-    drop(guard);
-    if let Some(next_gpa) = *NEXT_GPA.lock().unwrap() {
-        return (next_gpa)(instance, name, function);
-    }
-
-    xr::Result::ERROR_HANDLE_INVALID
-}
-
-unsafe fn hand_from_path(state: &LayerState, path: xr::Path) -> Option<Hand> {
-    if path == xr::Path::NULL {
-        return None;
-    }
-
-    let mut buf = [0u8; 256];
-    let mut len: u32 = 0;
-    let r = (state.next.path_to_string)(
-        state.instance,
-        path,
-        buf.len() as u32,
-        &mut len,
-        buf.as_mut_ptr() as *mut c_char,
-    );
-    if r != xr::Result::SUCCESS || len == 0 {
-        return None;
-    }
-
-    let path_str = std::str::from_utf8(&buf[..len as usize - 1]).ok()?;
-    if path_str.contains("left") {
-        Some(Hand::Left)
-    } else if path_str.contains("right") {
-        Some(Hand::Right)
-    } else {
-        None
+    match *NEXT_GPA.lock().unwrap() {
+        Some(gpa) => gpa(instance, name.as_ptr(), function),
+        None => xr::Result::ERROR_HANDLE_INVALID,
     }
 }
 
-// ============================================================
-// Intercepted functions
-// ============================================================
-
-unsafe extern "system" fn hook_enumerate_extensions(
-    layer_name: *const c_char,
-    property_capacity_input: u32,
-    property_count_output: *mut u32,
-    properties: *mut xr::ExtensionProperties,
-) -> xr::Result {
-    let next_fn: xr::pfn::EnumerateInstanceExtensionProperties = {
-        if let Some(next_gpa) = *NEXT_GPA.lock().unwrap() {
-            let mut fp: Option<xr::pfn::VoidFunction> = None;
-            let _ = (next_gpa)(
-                xr::Instance::NULL,
-                b"xrEnumerateInstanceExtensionProperties\0".as_ptr() as *const c_char,
-                &mut fp,
-            );
-            match fp {
-                Some(f) => std::mem::transmute(f),
-                None => return xr::Result::ERROR_RUNTIME_FAILURE,
-            }
-        } else {
-            return xr::Result::ERROR_RUNTIME_FAILURE;
-        }
-    };
-
-    (next_fn)(layer_name, property_capacity_input, property_count_output, properties)
-}
-
-unsafe extern "system" fn hook_destroy_instance(instance: xr::Instance) -> xr::Result {
-    let next_fn;
-    {
-        let guard = LAYER.lock().unwrap();
-        next_fn = guard.as_ref().map(|s| s.next.destroy_instance);
-    }
-    let result = if let Some(f) = next_fn {
-        (f)(instance)
-    } else {
-        xr::Result::ERROR_HANDLE_INVALID
-    };
-
-    // Clean up layer state
-    *LAYER.lock().unwrap() = None;
-    log::info!("[ClearXR Layer] Instance destroyed, layer cleaned up.");
-    result
-}
-
-unsafe extern "system" fn hook_get_system(
-    instance: xr::Instance,
-    get_info: *const xr::SystemGetInfo,
-    system_id: *mut xr::SystemId,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    let result = (state.next.get_system)(instance, get_info, system_id);
-    if result == xr::Result::SUCCESS {
-        state.system_id = (*system_id).into_raw();
-        log::info!("[ClearXR Layer] Got system_id: {}", state.system_id);
-
-        // Now create the opaque channel if extension was enabled
-        if state.has_opaque_ext && state.opaque.is_none() {
-            if let Some(mut ch) = OpaqueChannel::load(
-                state.next.get_instance_proc_addr,
-                instance,
-                state.system_id,
-            ) {
-                if ch.create_channel() {
-                    state.opaque = Some(ch);
-                } else {
-                    log::warn!("[ClearXR Layer] Opaque channel create failed.");
-                }
-            } else {
-                log::warn!("[ClearXR Layer] Opaque channel functions not available.");
-            }
-        }
-    }
-    result
-}
-
-unsafe extern "system" fn hook_create_session(
-    instance: xr::Instance,
-    ci: *const xr::SessionCreateInfo,
-    session: *mut xr::Session,
-) -> xr::Result {
-    let guard = LAYER.lock().unwrap();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-    (state.next.create_session)(instance, ci, session)
-}
-
-unsafe extern "system" fn hook_destroy_session(session: xr::Session) -> xr::Result {
-    let guard = LAYER.lock().unwrap();
-    let state = match guard.as_ref() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-    (state.next.destroy_session)(session)
-}
-
-unsafe extern "system" fn hook_suggest_bindings(
-    instance: xr::Instance,
-    suggested_bindings: *const xr::InteractionProfileSuggestedBinding,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    // Record the bindings so we know which actions to override later.
-    // Bindings that the layer handles (touch sensors, thumbstick click, menu)
-    // are stripped before passing to the runtime — they may not exist in the
-    // interaction profile and would cause the entire batch to be rejected.
-    let sb = &*suggested_bindings;
-    let bindings = std::slice::from_raw_parts(sb.suggested_bindings, sb.count_suggested_bindings as usize);
-
-    let mut passthrough: Vec<xr::ActionSuggestedBinding> = Vec::with_capacity(bindings.len());
-
-    for binding in bindings {
-        let mut buf = [0u8; 512];
-        let mut len: u32 = 0;
-        let r = (state.next.path_to_string)(
-            instance,
-            binding.binding,
-            buf.len() as u32,
-            &mut len,
-            buf.as_mut_ptr() as *mut c_char,
-        );
-        if r != xr::Result::SUCCESS || len == 0 {
-            passthrough.push(*binding);
-            continue;
-        }
-
-        let path_str = match std::str::from_utf8(&buf[..len as usize - 1]) {
-            Ok(s) => s,
-            Err(_) => { passthrough.push(*binding); continue; }
-        };
-
-        let mut handled_by_layer = false;
-
-        if let Some((hand, component)) = parse_binding_path(path_str) {
-            let action_raw = binding.action.into_raw();
-            if let Some(src) = component_to_bool(component) {
-                log::info!(
-                    "[ClearXR Layer] Recorded bool binding: action 0x{:x} {:?} {} → {:?} (stripped from runtime)",
-                    action_raw, hand, path_str, src
-                );
-                state.overrides.insert((action_raw, hand), src);
-                handled_by_layer = true;
-            }
-
-            if let Some(src) = component_to_float(component) {
-                log::info!(
-                    "[ClearXR Layer] Recorded float binding: action 0x{:x} {:?} {} → {:?} (stripped from runtime)",
-                    action_raw, hand, path_str, src
-                );
-                state.float_overrides.insert((action_raw, hand), src);
-                handled_by_layer = true;
-            }
-
-            if is_haptic_output_path(component) {
-                layer_log!(
-                    info,
-                    "[ClearXR Layer] Recorded haptic binding: action 0x{:x} {:?} {}",
-                    action_raw,
-                    hand,
-                    path_str
-                );
-                state.haptic_actions.insert((action_raw, hand));
-            }
-        }
-
-        if !handled_by_layer {
-            passthrough.push(*binding);
-        }
-    }
-
-    // Pass the filtered bindings to the runtime
-    let filtered_sb = xr::InteractionProfileSuggestedBinding {
-        ty: sb.ty,
-        next: sb.next,
-        interaction_profile: sb.interaction_profile,
-        count_suggested_bindings: passthrough.len() as u32,
-        suggested_bindings: passthrough.as_ptr(),
-    };
-    layer_log!(info,
-        "[ClearXR Layer] Passing {} of {} bindings to runtime ({} handled by layer)",
-        passthrough.len(), bindings.len(), bindings.len() - passthrough.len()
-    );
-    (state.next.suggest_interaction_profile_bindings)(instance, &filtered_sb)
-}
-
-unsafe extern "system" fn hook_sync_actions(
-    session: xr::Session,
-    sync_info: *const xr::ActionsSyncInfo,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    // Pass through first
-    let result = (state.next.sync_actions)(session, sync_info);
-
-    // Then poll the opaque channel
-    if let Some(ref mut ch) = state.opaque {
-        ch.poll();
-    }
-
-    result
-}
-
-unsafe extern "system" fn hook_apply_haptic_feedback(
-    session: xr::Session,
-    haptic_action_info: *const xr::HapticActionInfo,
-    haptic_feedback: *const xr::HapticBaseHeader,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    let result = (state.next.apply_haptic_feedback)(session, haptic_action_info, haptic_feedback);
-    if result != xr::Result::SUCCESS || haptic_action_info.is_null() || haptic_feedback.is_null() {
-        return result;
-    }
-
-    let info = &*haptic_action_info;
-    let feedback = &*haptic_feedback;
-    if feedback.ty != xr::HapticVibration::TYPE {
-        layer_log!(
-            warn,
-            "[ClearXR Layer] Unsupported haptic type {:?}; only vibration packets are forwarded.",
-            feedback.ty
-        );
-        return result;
-    }
-
-    let vibration = &*(haptic_feedback as *const xr::HapticVibration);
-    let duration_ns = if vibration.duration.as_nanos() < 0 {
-        0
-    } else {
-        vibration.duration.as_nanos() as u64
-    };
-    let action_raw = info.action.into_raw();
-
-    let mut hands = Vec::with_capacity(2);
-    if let Some(hand) = hand_from_path(state, info.subaction_path) {
-        hands.push(hand);
-    } else {
-        if state.haptic_actions.contains(&(action_raw, Hand::Left)) {
-            hands.push(Hand::Left);
-        }
-        if state.haptic_actions.contains(&(action_raw, Hand::Right)) {
-            hands.push(Hand::Right);
-        }
-    }
-
-    if hands.is_empty() {
-        layer_log!(
-            warn,
-            "[ClearXR Layer] No hand mapping found for haptic action 0x{:x}.",
-            action_raw
-        );
-        return result;
-    }
-
-    if let Some(ref mut ch) = state.opaque {
-        for hand in hands {
-            let hand_idx = match hand {
-                Hand::Left => 0,
-                Hand::Right => 1,
-            };
-            let sent = ch.send_haptic(hand_idx, duration_ns, vibration.frequency, vibration.amplitude);
-            layer_log!(
-                info,
-                "[ClearXR Layer] Apply haptic action=0x{:x} hand={:?} duration_ns={} frequency={} amplitude={} sent={}",
-                action_raw,
-                hand,
-                duration_ns,
-                vibration.frequency,
-                vibration.amplitude,
-                sent
-            );
-        }
-    } else {
-        layer_log!(warn, "[ClearXR Layer] Haptic request received before opaque channel was ready.");
-    }
-
-    result
-}
-
-unsafe extern "system" fn hook_stop_haptic_feedback(
-    session: xr::Session,
-    haptic_action_info: *const xr::HapticActionInfo,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    let result = (state.next.stop_haptic_feedback)(session, haptic_action_info);
-    if result != xr::Result::SUCCESS || haptic_action_info.is_null() {
-        return result;
-    }
-
-    let info = &*haptic_action_info;
-    let action_raw = info.action.into_raw();
-
-    let mut hands = Vec::with_capacity(2);
-    if let Some(hand) = hand_from_path(state, info.subaction_path) {
-        hands.push(hand);
-    } else {
-        if state.haptic_actions.contains(&(action_raw, Hand::Left)) {
-            hands.push(Hand::Left);
-        }
-        if state.haptic_actions.contains(&(action_raw, Hand::Right)) {
-            hands.push(Hand::Right);
-        }
-    }
-
-    if let Some(ref mut ch) = state.opaque {
-        for hand in hands {
-            let hand_idx = match hand {
-                Hand::Left => 0,
-                Hand::Right => 1,
-            };
-            let sent = ch.send_haptic(hand_idx, 0, 0.0, 0.0);
-            layer_log!(
-                info,
-                "[ClearXR Layer] Stop haptic action=0x{:x} hand={:?} sent={}",
-                action_raw,
-                hand,
-                sent
-            );
-        }
-    }
-
-    result
-}
-
-unsafe extern "system" fn hook_get_action_state_boolean(
-    session: xr::Session,
-    get_info: *const xr::ActionStateGetInfo,
-    state_out: *mut xr::ActionStateBoolean,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    // Call the next layer first to get the base result
-    let result = (state.next.get_action_state_boolean)(session, get_info, state_out);
-    if result != xr::Result::SUCCESS { return result; }
-
-    // Check if we have opaque channel data to override with
-    let pkt = match state.opaque.as_ref().and_then(|ch| ch.latest) {
-        Some(p) => p,
-        None => return result,
-    };
-
-    let info = &*get_info;
-    let action_raw = info.action.into_raw();
-
-    // Determine which hand the subaction path refers to
-    let hand = if info.subaction_path == xr::Path::NULL {
-        // No subaction path — check both hands. Prefer left (arbitrary).
-        if state.overrides.contains_key(&(action_raw, Hand::Left)) {
-            Hand::Left
-        } else if state.overrides.contains_key(&(action_raw, Hand::Right)) {
-            Hand::Right
-        } else {
-            return result;
-        }
-    } else {
-        // Resolve subaction path to hand
-        let mut buf = [0u8; 256];
-        let mut len: u32 = 0;
-        let r = (state.next.path_to_string)(
-            state.instance,
-            info.subaction_path,
-            buf.len() as u32,
-            &mut len,
-            buf.as_mut_ptr() as *mut c_char,
-        );
-        if r != xr::Result::SUCCESS { return result; }
-        let path_str = std::str::from_utf8(&buf[..len as usize - 1]).unwrap_or("");
-        if path_str.contains("left") {
-            Hand::Left
-        } else if path_str.contains("right") {
-            Hand::Right
-        } else {
-            return result;
-        }
-    };
-
-    // Look up the override
-    if let Some(&src) = state.overrides.get(&(action_raw, hand)) {
-        let hand_data = match hand {
-            Hand::Left => {
-                if pkt.active_hands & 0x01 != 0 { pkt.left } else { return result; }
-            }
-            Hand::Right => {
-                if pkt.active_hands & 0x02 != 0 { pkt.right } else { return result; }
-            }
-        };
-
-        let active = match src {
-            BoolSource::Bit(bit) => hand_data.buttons & bit != 0,
-            BoolSource::TriggerClick => hand_data.trigger >= 1.0,
-            BoolSource::GripClick => hand_data.grip >= 1.0,
-        };
-
-        let out = &mut *state_out;
-        out.current_state = if active { xr::TRUE } else { xr::FALSE };
-        out.is_active = xr::TRUE;
-    }
-
-    result
-}
-
-unsafe extern "system" fn hook_get_action_state_float(
-    session: xr::Session,
-    get_info: *const xr::ActionStateGetInfo,
-    state_out: *mut xr::ActionStateFloat,
-) -> xr::Result {
-    let mut guard = LAYER.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return xr::Result::ERROR_HANDLE_INVALID,
-    };
-
-    let result = (state.next.get_action_state_float)(session, get_info, state_out);
-    if result != xr::Result::SUCCESS { return result; }
-
-    let pkt = match state.opaque.as_ref().and_then(|ch| ch.latest) {
-        Some(p) => p,
-        None => return result,
-    };
-
-    let info = &*get_info;
-    let action_raw = info.action.into_raw();
-
-    let hand = if info.subaction_path == xr::Path::NULL {
-        if state.float_overrides.contains_key(&(action_raw, Hand::Left)) {
-            Hand::Left
-        } else if state.float_overrides.contains_key(&(action_raw, Hand::Right)) {
-            Hand::Right
-        } else {
-            return result;
-        }
-    } else {
-        match hand_from_path(state, info.subaction_path) {
-            Some(h) => h,
-            None => return result,
-        }
-    };
-
-    if let Some(&src) = state.float_overrides.get(&(action_raw, hand)) {
-        let hand_data = match hand {
-            Hand::Left => {
-                if pkt.active_hands & 0x01 != 0 { pkt.left } else { return result; }
-            }
-            Hand::Right => {
-                if pkt.active_hands & 0x02 != 0 { pkt.right } else { return result; }
-            }
-        };
-
-        let value = match src {
-            FloatSource::Trigger => hand_data.trigger,
-            FloatSource::Grip => hand_data.grip,
-            FloatSource::TouchBit(bit) => {
-                if hand_data.buttons & bit != 0 { 1.0 } else { 0.0 }
-            }
-        };
-
-        let out = &mut *state_out;
-        out.current_state = value;
-        out.is_active = xr::TRUE;
-    }
-
+pub(crate) unsafe extern "system" fn destroy_instance(instance: xr::Instance) -> xr::Result {
+    let Some(layer) = layer() else { return xr::Result::ERROR_HANDLE_INVALID };
+    let result = (layer.next.destroy_instance)(instance);
+    *LAYER.write().unwrap() = None;
     result
 }

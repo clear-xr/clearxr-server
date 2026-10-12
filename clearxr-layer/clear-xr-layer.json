@@ -5,7 +5,7 @@
         "library_path": ".\\clear_xr_layer.dll",
         "api_version": "1.0.0",
         "implementation_version": "1",
-        "description": "Clear XR - Injects controller touch/click events via NVCX opaque data channel",
+        "description": "Clear XR - Presents PSVR2 Sense controllers to OpenXR games and applies stream settings, via the CloudXR opaque data channel",
         "disable_environment": "DISABLE_CLEARXR_LAYER"
     }
 }

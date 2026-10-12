@@ -2,14 +2,14 @@
 name = "clear-xr-layer"
 version = "0.1.0"
 edition = "2021"
-description = "OpenXR API layer that injects controller events from NV opaque data channel"
+description = "OpenXR API layer that presents the Clear XR client's PSVR2 Sense controllers to games and applies its stream configuration"
 
 [lib]
 crate-type = ["cdylib"]
 name = "clear_xr_layer"
 
 [dependencies]
-openxr-sys = "0.10"
+openxr-sys = "0.13"
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

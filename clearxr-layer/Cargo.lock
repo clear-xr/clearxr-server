@@ -186,9 +186,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openxr-sys"
-version = "0.10.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1534b2c14b56564e58b91f5015817e1d87bd43ca12a188eda6a9ea3859b0ec25"
+checksum = "4b8d66081de28c2fa40216182a37292fe38aeea20bc184612504d5e64daf5359"
 dependencies = [
  "libc",
 ]
